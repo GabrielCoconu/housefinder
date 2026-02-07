@@ -41,11 +41,14 @@ logger = logging.getLogger('scout_agent')
 @dataclass
 class ScrapingConfig:
     """Configuration for scraping."""
-    max_pages: int = 3
+    max_pages: int = 50  # Bulk scraping: up to 50 pages
     max_price: int = 200000
     min_price: int = 100000
     location: str = "bucuresti"
     listing_type: str = "case-vile"  # houses/villas
+    batch_size: int = 100  # Process in batches of 100
+    max_listings_total: int = 1000  # Stop after 1000 listings per source
+    rate_limit_delay: float = 1.0  # Seconds between requests
 
 
 @dataclass  
@@ -350,17 +353,226 @@ class ScoutAgent:
         logger.info(f"✅ Scraped {len(listings)} listings from Storia.ro")
         return listings
     
+    async def scrape_imobiliare_bulk(self, page: Page) -> List[Listing]:
+        """Bulk scrape Imobiliare.ro with pagination."""
+        logger.info(f"🕵️  Bulk scraping Imobiliare.ro (max {self.config.max_pages} pages)...")
+        all_listings = []
+        base_url = "https://www.imobiliare.ro"
+        
+        for page_num in range(1, self.config.max_pages + 1):
+            if len(all_listings) >= self.config.max_listings_total:
+                logger.info(f"⛔ Reached max listings limit: {self.config.max_listings_total}")
+                break
+            
+            try:
+                # Build URL with pagination
+                if page_num == 1:
+                    search_url = f"{base_url}/vanzare-case-vile/{self.config.location}?pretmax={self.config.max_price}"
+                else:
+                    search_url = f"{base_url}/vanzare-case-vile/{self.config.location}?pagina={page_num}&pretmax={self.config.max_price}"
+                
+                logger.info(f"  📄 Page {page_num}: {search_url}")
+                await page.goto(search_url, wait_until='networkidle', timeout=30000)
+                
+                # Wait for listings
+                try:
+                    await page.wait_for_selector('.box-anunt', timeout=10000)
+                except PlaywrightTimeout:
+                    logger.warning(f"  ⚠️  No listings found on page {page_num}")
+                    break
+                
+                # Get listings on this page
+                cards = await page.query_selector_all('.box-anunt')
+                logger.info(f"  📊 Found {len(cards)} listings on page {page_num}")
+                
+                if not cards:
+                    logger.info("  ✅ No more listings available")
+                    break
+                
+                # Parse each card
+                for card in cards:
+                    try:
+                        title_el = await card.query_selector('.titlu-anunt, h2')
+                        title = await title_el.inner_text() if title_el else "N/A"
+                        
+                        price_el = await card.query_selector('.pret, .price')
+                        price_text = await price_el.inner_text() if price_el else ""
+                        price_raw, price_eur = self.parse_price(price_text)
+                        
+                        location_el = await card.query_selector('.location, .locatie')
+                        location = await location_el.inner_text() if location_el else "Bucuresti"
+                        
+                        surface_el = await card.query_selector('.surface, .suprafata')
+                        surface_text = await surface_el.inner_text() if surface_el else ""
+                        surface_mp = self.parse_surface(surface_text)
+                        
+                        rooms_el = await card.query_selector('.rooms, .camere')
+                        rooms_text = await rooms_el.inner_text() if rooms_el else ""
+                        rooms = self.parse_rooms(rooms_text)
+                        
+                        link_el = await card.query_selector('a')
+                        href = await link_el.get_attribute('href') if link_el else ""
+                        url = urljoin(base_url, href)
+                        
+                        features = f"{surface_text} {rooms_text}".strip()
+                        metro_nearby = self.check_metro_nearby(f"{title} {location} {features}")
+                        
+                        listing = Listing(
+                            source='imobiliare.ro',
+                            external_id=href.split('/')[-1] if '/' in href else '',
+                            url=url,
+                            title=title.strip(),
+                            price_raw=price_raw,
+                            price_eur=price_eur,
+                            location=location.strip(),
+                            surface_mp=surface_mp,
+                            rooms=rooms,
+                            features_raw=features,
+                            metro_nearby=metro_nearby,
+                            scraped_at=datetime.now(timezone.utc).isoformat(),
+                            raw_data={'page': page_num}
+                        )
+                        
+                        # Validate before adding
+                        is_valid, error_msg = self.validate_listing(listing)
+                        if is_valid:
+                            all_listings.append(listing)
+                        else:
+                            logger.debug(f"  ❌ Rejected: {error_msg}")
+                        
+                    except Exception as e:
+                        logger.warning(f"  ⚠️  Error parsing card: {e}")
+                        continue
+                
+                logger.info(f"  ✅ Page {page_num} complete. Total: {len(all_listings)} listings")
+                
+                # Rate limiting
+                if page_num < self.config.max_pages:
+                    await asyncio.sleep(self.config.rate_limit_delay)
+                
+            except Exception as e:
+                logger.error(f"  ❌ Error on page {page_num}: {e}")
+                continue
+        
+        logger.info(f"✅ Imobiliare.ro bulk complete: {len(all_listings)} listings from {page_num} pages")
+        return all_listings
+    
+    async def scrape_storia_bulk(self, page: Page) -> List[Listing]:
+        """Bulk scrape Storia.ro with pagination."""
+        logger.info(f"🕵️  Bulk scraping Storia.ro (max {self.config.max_pages} pages)...")
+        all_listings = []
+        base_url = "https://www.storia.ro"
+        
+        for page_num in range(1, self.config.max_pages + 1):
+            if len(all_listings) >= self.config.max_listings_total:
+                logger.info(f"⛔ Reached max listings limit: {self.config.max_listings_total}")
+                break
+            
+            try:
+                # Build URL with pagination
+                if page_num == 1:
+                    search_url = f"{base_url}/ro/cautare/vanzare/casa/vila/bucuresti?priceMax={self.config.max_price}"
+                else:
+                    search_url = f"{base_url}/ro/cautare/vanzare/casa/vila/bucuresti?page={page_num}&priceMax={self.config.max_price}"
+                
+                logger.info(f"  📄 Page {page_num}: {search_url}")
+                await page.goto(search_url, wait_until='networkidle', timeout=30000)
+                
+                # Wait for listings
+                try:
+                    await page.wait_for_selector('[data-cy="listing-item"]', timeout=10000)
+                except PlaywrightTimeout:
+                    logger.warning(f"  ⚠️  No listings found on page {page_num}")
+                    break
+                
+                # Get listings
+                cards = await page.query_selector_all('[data-cy="listing-item"]')
+                logger.info(f"  📊 Found {len(cards)} listings on page {page_num}")
+                
+                if not cards:
+                    logger.info("  ✅ No more listings available")
+                    break
+                
+                # Parse each card
+                for card in cards:
+                    try:
+                        title_el = await card.query_selector('h3, [data-cy="listing-item-title"]')
+                        title = await title_el.inner_text() if title_el else "N/A"
+                        
+                        price_el = await card.query_selector('[data-cy="listing-item-price"]')
+                        price_text = await price_el.inner_text() if price_el else ""
+                        price_raw, price_eur = self.parse_price(price_text)
+                        
+                        location_el = await card.query_selector('[data-cy="listing-item-location"]')
+                        location = await location_el.inner_text() if location_el else "Bucuresti"
+                        
+                        subtitle_el = await card.query_selector('[data-cy="listing-item-subtitle"]')
+                        subtitle = await subtitle_el.inner_text() if subtitle_el else ""
+                        
+                        surface_mp = self.parse_surface(subtitle)
+                        rooms = self.parse_rooms(subtitle)
+                        
+                        link_el = await card.query_selector('a')
+                        href = await link_el.get_attribute('href') if link_el else ""
+                        url = urljoin(base_url, href)
+                        
+                        features = subtitle.strip()
+                        metro_nearby = self.check_metro_nearby(f"{title} {location} {features}")
+                        
+                        listing = Listing(
+                            source='storia.ro',
+                            external_id=href.split('/')[-1] if '/' in href else '',
+                            url=url,
+                            title=title.strip(),
+                            price_raw=price_raw,
+                            price_eur=price_eur,
+                            location=location.strip(),
+                            surface_mp=surface_mp,
+                            rooms=rooms,
+                            features_raw=features,
+                            metro_nearby=metro_nearby,
+                            scraped_at=datetime.now(timezone.utc).isoformat(),
+                            raw_data={'page': page_num}
+                        )
+                        
+                        # Validate before adding
+                        is_valid, error_msg = self.validate_listing(listing)
+                        if is_valid:
+                            all_listings.append(listing)
+                        else:
+                            logger.debug(f"  ❌ Rejected: {error_msg}")
+                        
+                    except Exception as e:
+                        logger.warning(f"  ⚠️  Error parsing card: {e}")
+                        continue
+                
+                logger.info(f"  ✅ Page {page_num} complete. Total: {len(all_listings)} listings")
+                
+                # Rate limiting
+                if page_num < self.config.max_pages:
+                    await asyncio.sleep(self.config.rate_limit_delay)
+                
+            except Exception as e:
+                logger.error(f"  ❌ Error on page {page_num}: {e}")
+                continue
+        
+        logger.info(f"✅ Storia.ro bulk complete: {len(all_listings)} listings from {page_num} pages")
+        return all_listings
+    
     async def run(self, config: Optional[ScrapingConfig] = None):
-        """Main scraping loop."""
+        """Main scraping loop - BULK MODE for 6 months of data."""
         if config:
             self.config = config
         
         logger.info("="*60)
-        logger.info("🏠 CASA HUNT - SCOUT AGENT STARTING")
+        logger.info("🏠 CASA HUNT - SCOUT AGENT - BULK MODE")
+        logger.info(f"📄 Max pages per source: {self.config.max_pages}")
+        logger.info(f"📦 Batch size: {self.config.batch_size}")
+        logger.info(f"🎯 Max listings: {self.config.max_listings_total}")
         logger.info("="*60)
         
         start_time = datetime.now(timezone.utc)
-        all_listings: List[Listing] = []
+        total_new_listings = 0
         
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
@@ -370,49 +582,69 @@ class ScoutAgent:
             page = await context.new_page()
             
             try:
-                # Scrape both sources
-                imobiliare_listings = await self.scrape_imobiliare(page)
-                storia_listings = await self.scrape_storia(page)
+                # Scrape both sources with pagination
+                logger.info("\n🕵️  Starting Imobiliare.ro bulk scrape...")
+                imobiliare_listings = await self.scrape_imobiliare_bulk(page)
+                
+                logger.info("\n🕵️  Starting Storia.ro bulk scrape...")
+                storia_listings = await self.scrape_storia_bulk(page)
                 
                 all_listings = imobiliare_listings + storia_listings
                 
             except Exception as e:
                 logger.error(f"Scraping error: {e}")
+                import traceback
+                traceback.print_exc()
             
             finally:
                 await browser.close()
         
-        # Save to Supabase
+        # Process in batches
         if all_listings:
-            logger.info(f"💾 Saving {len(all_listings)} listings to Supabase...")
+            logger.info(f"\n💾 Processing {len(all_listings)} total listings...")
             
             # Convert to dicts
             listing_dicts = [asdict(l) for l in all_listings]
             
-            # Check for duplicates
-            urls = [l.url for l in all_listings]
+            # Check for duplicates in batches
+            urls = [l['url'] for l in all_listings]
             existing = self.db.get_existing_urls(urls)
             
             new_listings = [l for l in listing_dicts if l['url'] not in existing]
-            logger.info(f"Found {len(existing)} duplicates, {len(new_listings)} new listings")
+            logger.info(f"📊 Found {len(existing)} duplicates, {len(new_listings)} new listings")
             
             if new_listings:
-                # Insert to Supabase
-                inserted_ids = self.db.insert_listings(new_listings)
-                logger.info(f"✅ Inserted {len(inserted_ids)} listings")
+                # Process in batches
+                batch_size = self.config.batch_size
+                total_inserted = 0
                 
-                # Create event
+                for i in range(0, len(new_listings), batch_size):
+                    batch = new_listings[i:i+batch_size]
+                    inserted_ids = self.db.insert_listings(batch)
+                    total_inserted += len(inserted_ids)
+                    logger.info(f"  ✅ Batch {i//batch_size + 1}: Inserted {len(inserted_ids)} listings")
+                
+                logger.info(f"\n🎉 Total inserted: {total_inserted} listings")
+                
+                # Create events and missions
                 self.db.create_event('listings_scraped', {
-                    'count': len(inserted_ids),
+                    'count': total_inserted,
                     'sources': list(set(l['source'] for l in new_listings)),
-                    'timestamp': start_time.isoformat()
+                    'timestamp': start_time.isoformat(),
+                    'mode': 'bulk'
                 })
                 
-                # Create analyze missions
-                self.db.create_mission('analyze', 'pending', {
-                    'listing_ids': inserted_ids,
-                    'count': len(inserted_ids)
-                })
+                # Create analyze missions in batches
+                all_ids = [l['id'] for l in new_listings if 'id' in l]
+                for i in range(0, len(all_ids), batch_size):
+                    batch_ids = all_ids[i:i+batch_size]
+                    self.db.create_mission('analyze', 'pending', {
+                        'listing_ids': batch_ids,
+                        'count': len(batch_ids),
+                        'batch': i//batch_size + 1
+                    })
+                
+                logger.info(f"🎯 Created {len(range(0, len(all_ids), batch_size))} analyze missions")
                 
                 logger.info(f"🎯 Created analyze mission for {len(inserted_ids)} listings")
             else:
