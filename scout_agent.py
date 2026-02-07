@@ -6,6 +6,11 @@ Scrapes Imobiliare.ro and Storia.ro, saves to Supabase
 
 import os
 import sys
+
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
 import re
 import json
 import asyncio

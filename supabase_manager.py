@@ -9,6 +9,10 @@ import logging
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timezone
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
 try:
     from supabase import create_client, Client
 except ImportError:

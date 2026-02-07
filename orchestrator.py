@@ -6,6 +6,11 @@ Coordinates all agents: Scout, Analyzer, Decision, Notifier
 
 import os
 import sys
+
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
 import asyncio
 import logging
 from datetime import datetime, timezone
