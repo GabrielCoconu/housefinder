@@ -1,0 +1,22 @@
+# Casa Hunt - Python Dependencies
+
+# Web Scraping
+playwright>=1.40.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# Supabase
+supabase>=2.0.0
+
+# Utilities
+python-dotenv>=1.0.0
+croniter>=2.0.0
+tenacity>=8.2.0
+
+# Data
+pydantic>=2.5.0
+
+# Optional (for development)
+pytest>=7.4.0
+black>=23.0.0
+flake8>=6.0.0

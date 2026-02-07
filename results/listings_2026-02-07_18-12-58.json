@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-02-07_18-12-58",
+  "source": "placeholder",
+  "listings": [],
+  "note": "This is a placeholder. The actual scraper will be implemented by another agent.",
+  "criteria": {
+    "location": "Bucharest periphery with metro access",
+    "max_price_eur": 200000,
+    "property_type": "houses"
+  }
+}

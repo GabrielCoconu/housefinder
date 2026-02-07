@@ -1,0 +1,16 @@
+{
+  "timestamp": "2026-02-07_18-38-39",
+  "total_listings": 0,
+  "bucharest_listings": 0,
+  "metro_accessible": 0,
+  "sources": [
+    "imobiliare.ro",
+    "storia.ro"
+  ],
+  "criteria": {
+    "location": "Bucharest + Ilfov periphery",
+    "max_price_eur": 200000,
+    "property_type": "houses/villas"
+  },
+  "listings": []
+}
