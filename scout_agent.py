@@ -589,7 +589,14 @@ class ScoutAgent:
                         
                         # Features
                         surface_mp = item.get('areaInSquareMeters')
-                        rooms = item.get('roomsNumber')
+                        rooms_raw = item.get('roomsNumber')
+                        # Convert string rooms (ONE, TWO, THREE, FOUR) to integers
+                        rooms_map = {'ONE': 1, 'TWO': 2, 'THREE': 3, 'FOUR': 4, 'FIVE': 5, 
+                                     'SIX': 6, 'SEVEN': 7, 'EIGHT': 8, 'NINE': 9, 'TEN': 10}
+                        if isinstance(rooms_raw, str):
+                            rooms = rooms_map.get(rooms_raw.upper())
+                        else:
+                            rooms = rooms_raw
                         terrain = item.get('terrainAreaInSquareMeters')
                         
                         # Features raw
