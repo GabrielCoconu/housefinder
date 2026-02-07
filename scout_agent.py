@@ -140,6 +140,46 @@ class ScoutAgent:
         text_lower = text.lower()
         return any(kw in text_lower for kw in metro_keywords)
     
+    def validate_listing(self, listing: Dict) -> tuple[bool, str]:
+        """Validate listing before saving. Returns (is_valid, error_message)."""
+        url = listing.get('url', '')
+        price = listing.get('price_eur')
+        location = listing.get('location', '')
+        
+        # Validate URL
+        if not url:
+            return False, "URL is empty"
+        
+        # Reject test URLs
+        test_domains = ['test.com', 'example.com', 'localhost']
+        if any(td in url for td in test_domains):
+            return False, f"Test URL rejected: {url}"
+        
+        # Must be from allowed sources
+        allowed_sources = ['imobiliare.ro', 'storia.ro']
+        if not any(src in url for src in allowed_sources):
+            return False, f"URL not from allowed source: {url}"
+        
+        # Validate price
+        if price is None:
+            return False, "Price is None"
+        
+        if price < 10000:
+            return False, f"Price too low: {price}€"
+        
+        if price > 1000000:
+            return False, f"Price too high: {price}€"
+        
+        # Validate location
+        if not location or location in ['', 'N/A']:
+            return False, "Location is empty"
+        
+        # Reject generic location
+        if location.lower().strip() == 'bucuresti':
+            return False, "Location too generic (just 'Bucuresti')"
+        
+        return True, "OK"
+    
     async def scrape_imobiliare(self, page: Page) -> List[Listing]:
         """Scrape Imobiliare.ro listings."""
         logger.info("🕵️  Scraping Imobiliare.ro...")
@@ -212,7 +252,13 @@ class ScoutAgent:
                         scraped_at=datetime.now(timezone.utc).isoformat(),
                         raw_data={'selector': 'box-anunt'}
                     )
-                    listings.append(listing)
+                    
+                    # Validate before adding
+                    is_valid, error_msg = self.validate_listing(listing)
+                    if is_valid:
+                        listings.append(listing)
+                    else:
+                        logger.warning(f"❌ Rejected listing: {error_msg} - {title[:30]}")
                     
                 except Exception as e:
                     logger.warning(f"Error parsing Imobiliare card: {e}")

@@ -263,6 +263,13 @@ Review and contact if interested.
                     if decision != 'APPROVE':
                         continue
                     
+                    # Validate URL before notifying (QA check)
+                    url = listing.get('url', '')
+                    test_domains = ['test.com', 'example.com', 'localhost']
+                    if not url or any(td in url for td in test_domains):
+                        logger.error(f"❌ Skipping notification - invalid URL: {url}")
+                        continue
+                    
                     # Format and send Telegram
                     message = self.format_telegram_message(listing, reason)
                     telegram_id = await self.send_telegram(message)

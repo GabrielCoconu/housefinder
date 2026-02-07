@@ -122,6 +122,9 @@ class AnalyzerAgent:
         
         total_score = price_score + metro_score + location_score + budget_score
         
+        # Clamp score to 0-100 range (QA validation)
+        total_score = max(0, min(100, total_score))
+        
         logger.info(f"Score breakdown for {listing.get('url', 'N/A')[:50]}...")
         logger.info(f"  Price/mp: {price_score}/40, Metro: {metro_score}/30, Location: {location_score}/20, Budget: {budget_score}/10")
         logger.info(f"  Total: {total_score}/100")
