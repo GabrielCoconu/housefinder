@@ -5,6 +5,7 @@ Sends alerts via Telegram and creates ClickUp tasks
 """
 
 import os
+import sys
 
 # Load environment variables
 from dotenv import load_dotenv
