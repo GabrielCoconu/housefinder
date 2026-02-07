@@ -15,6 +15,7 @@ import re
 import json
 import asyncio
 import logging
+import httpx
 from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple
@@ -143,11 +144,20 @@ class ScoutAgent:
         text_lower = text.lower()
         return any(kw in text_lower for kw in metro_keywords)
     
-    def validate_listing(self, listing: Dict) -> tuple[bool, str]:
+    def validate_listing(self, listing) -> tuple[bool, str]:
         """Validate listing before saving. Returns (is_valid, error_message)."""
-        url = listing.get('url', '')
-        price = listing.get('price_eur')
-        location = listing.get('location', '')
+        # Handle both Dict and Listing objects
+        if isinstance(listing, dict):
+            url = listing.get('url', '')
+            price = listing.get('price_eur')
+            location = listing.get('location', '')
+            title = listing.get('title', '')
+        else:
+            # It's a Listing dataclass
+            url = listing.url
+            price = listing.price_eur
+            location = listing.location
+            title = listing.title
         
         # Validate URL
         if not url:
@@ -177,9 +187,33 @@ class ScoutAgent:
         if not location or location in ['', 'N/A']:
             return False, "Location is empty"
         
-        # Reject generic location
+        # Check if title mentions a non-Bucharest city (reject listings outside Bucharest)
+        non_bucharest_cities = ['liebling', 'techirghiol', 'chinteni', 'floresti', 'cluj', 'timisoara', 
+                                'iasi', 'constanta', 'brasov', 'craiova', 'oradea', 'arad', 'sibiu',
+                                'galati', 'ploiesti', 'braila', 'buzau', 'focsani', 'bacau', 'suceava',
+                                'secusigiu', 'hoghiz', 'cuciulata', 'slatioara', 'suCEAGU', 'lerești',
+                                'paleu', 'seuca', 'rapsig', 'maramures', 'giurgiu', 'ialomita']
+        title_lower = title.lower()
+        for city in non_bucharest_cities:
+            if city in title_lower:
+                return False, f"Listing outside Bucharest: {city}"
+        
+        # For Storia, "Bucuresti" is acceptable if title contains sector info or neighborhood
+        # (Berceni, Militari, Drumul Taberei, etc. are all in Bucharest)
         if location.lower().strip() == 'bucuresti':
-            return False, "Location too generic (just 'Bucuresti')"
+            # Check if title has neighborhood/sector info
+            bucharest_indicators = ['sector', 'berceni', 'militari', 'drumul taberei', 'titan', 'pipera',
+                                   'aviatorilor', 'victoriei', 'universitate', 'obor', 'bragadiru',
+                                   'chitila', 'popesti-leordeni', 'voluntari', 'otopeni', 'baneasa',
+                                   'aparatorii patriei', 'salaj', 'rahova', 'ferentari', 'tei', 'floreasca',
+                                   'domenii', '1 mai', 'grivita', 'basarab', 'crangasi', 'militari',
+                                   'gorjului', 'lujerului', 'politehnica', 'cotroceni', 'eroilor',
+                                   'splai', 'dristor', 'muncii', 'timpuri noi', 'tineretului',
+                                   'vacaresti', 'sos', 'bulevardul', 'strada', 'calea', 'bld']
+            has_indicator = any(ind in title_lower for ind in bucharest_indicators)
+            
+            if not has_indicator:
+                return False, "Location too generic (just 'Bucuresti' with no sector/neighborhood)"
         
         return True, "OK"
     
@@ -457,71 +491,124 @@ class ScoutAgent:
         logger.info(f"✅ Imobiliare.ro bulk complete: {len(all_listings)} listings from {page_num} pages")
         return all_listings
     
-    async def scrape_storia_bulk(self, page: Page) -> List[Listing]:
-        """Bulk scrape Storia.ro with pagination."""
-        logger.info(f"🕵️  Bulk scraping Storia.ro (max {self.config.max_pages} pages)...")
-        all_listings = []
+    def extract_next_data(self, html: str) -> Optional[Dict]:
+        """Extract JSON data from __NEXT_DATA__ script tag."""
+        try:
+            # Find the __NEXT_DATA__ script tag
+            pattern = r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>'
+            match = re.search(pattern, html, re.DOTALL)
+            
+            if match:
+                json_str = match.group(1)
+                return json.loads(json_str)
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error extracting NEXT_DATA: {e}")
+            return None
+
+    async def scrape_storia_json(self, page_num: int = 1) -> List[Listing]:
+        """Scrape Storia.ro using __NEXT_DATA__ JSON extraction (fast, no browser needed)."""
+        logger.info(f"🕵️  Scraping Storia.ro page {page_num} via JSON...")
+        listings = []
         base_url = "https://www.storia.ro"
         
-        for page_num in range(1, self.config.max_pages + 1):
-            if len(all_listings) >= self.config.max_listings_total:
-                logger.info(f"⛔ Reached max listings limit: {self.config.max_listings_total}")
-                break
+        try:
+            # Build URL with pagination - use proper Storia URL format
+            # Note: Storia redirects generic searches to "toata-romania", need specific location ID
+            if page_num == 1:
+                search_url = f"{base_url}/ro/rezultate/vanzare/casa/bucuresti?priceMax={self.config.max_price}"
+            else:
+                search_url = f"{base_url}/ro/rezultate/vanzare/casa/bucuresti?page={page_num}&priceMax={self.config.max_price}"
             
-            try:
-                # Build URL with pagination
-                if page_num == 1:
-                    search_url = f"{base_url}/ro/cautare/vanzare/casa/vila/bucuresti?priceMax={self.config.max_price}"
-                else:
-                    search_url = f"{base_url}/ro/cautare/vanzare/casa/vila/bucuresti?page={page_num}&priceMax={self.config.max_price}"
+            logger.info(f"  📄 Fetching: {search_url}")
+            
+            # Use httpx for fast HTTP request
+            async with httpx.AsyncClient(
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Connection': 'keep-alive',
+                },
+                follow_redirects=True,
+                timeout=30.0
+            ) as client:
+                response = await client.get(search_url)
+                response.raise_for_status()
+                html = response.text
                 
-                logger.info(f"  📄 Page {page_num}: {search_url}")
-                await page.goto(search_url, wait_until='networkidle', timeout=30000)
+                logger.info(f"  📊 HTML size: {len(html):,} bytes")
                 
-                # Wait for listings
+                # Extract NEXT_DATA JSON
+                next_data = self.extract_next_data(html)
+                
+                if not next_data:
+                    logger.warning("  ⚠️  Could not extract __NEXT_DATA__")
+                    return listings
+                
+                # Navigate to search results
                 try:
-                    await page.wait_for_selector('[data-cy="listing-item"]', timeout=10000)
-                except PlaywrightTimeout:
-                    logger.warning(f"  ⚠️  No listings found on page {page_num}")
-                    break
+                    search_ads = next_data['props']['pageProps']['data']['searchAds']['items']
+                    logger.info(f"  📊 Found {len(search_ads)} listings in JSON")
+                except (KeyError, TypeError) as e:
+                    logger.error(f"  ❌ JSON structure error: {e}")
+                    return listings
                 
-                # Get listings
-                cards = await page.query_selector_all('[data-cy="listing-item"]')
-                logger.info(f"  📊 Found {len(cards)} listings on page {page_num}")
-                
-                if not cards:
-                    logger.info("  ✅ No more listings available")
-                    break
-                
-                # Parse each card
-                for card in cards:
+                # Parse each listing
+                for item in search_ads:
                     try:
-                        title_el = await card.query_selector('h3, [data-cy="listing-item-title"]')
-                        title = await title_el.inner_text() if title_el else "N/A"
+                        listing_id = str(item.get('id', ''))
+                        slug = item.get('slug', '')
+                        title = item.get('title', 'N/A')
                         
-                        price_el = await card.query_selector('[data-cy="listing-item-price"]')
-                        price_text = await price_el.inner_text() if price_el else ""
-                        price_raw, price_eur = self.parse_price(price_text)
+                        # Build URL
+                        url = f"{base_url}/ro/anunt/{slug}-{listing_id}"
                         
-                        location_el = await card.query_selector('[data-cy="listing-item-location"]')
-                        location = await location_el.inner_text() if location_el else "Bucuresti"
+                        # Price
+                        total_price = item.get('totalPrice', {})
+                        price_value = total_price.get('value')
+                        price_currency = total_price.get('currency', 'EUR')
                         
-                        subtitle_el = await card.query_selector('[data-cy="listing-item-subtitle"]')
-                        subtitle = await subtitle_el.inner_text() if subtitle_el else ""
+                        if price_value:
+                            if price_currency == 'RON':
+                                price_eur = int(price_value / self.eur_rate)
+                            else:
+                                price_eur = int(price_value)
+                            price_raw = f"{price_value} {price_currency}"
+                        else:
+                            price_eur = None
+                            price_raw = ""
                         
-                        surface_mp = self.parse_surface(subtitle)
-                        rooms = self.parse_rooms(subtitle)
+                        # Location
+                        location_data = item.get('location', {})
+                        city = location_data.get('city', {}).get('name', '')
+                        province = location_data.get('province', {}).get('name', '')
+                        location = f"{city}, {province}" if city and province else city or province or "Bucuresti"
                         
-                        link_el = await card.query_selector('a')
-                        href = await link_el.get_attribute('href') if link_el else ""
-                        url = urljoin(base_url, href)
+                        # Features
+                        surface_mp = item.get('areaInSquareMeters')
+                        rooms = item.get('roomsNumber')
+                        terrain = item.get('terrainAreaInSquareMeters')
                         
-                        features = subtitle.strip()
-                        metro_nearby = self.check_metro_nearby(f"{title} {location} {features}")
+                        # Features raw
+                        features_parts = []
+                        if surface_mp:
+                            features_parts.append(f"{surface_mp} mp")
+                        if terrain:
+                            features_parts.append(f"teren {terrain} mp")
+                        if rooms:
+                            features_parts.append(f"{rooms} camere")
+                        features_raw = " | ".join(features_parts)
+                        
+                        # Metro check
+                        short_desc = item.get('shortDescription', '')
+                        metro_nearby = self.check_metro_nearby(f"{title} {location} {short_desc}")
                         
                         listing = Listing(
                             source='storia.ro',
-                            external_id=href.split('/')[-1] if '/' in href else '',
+                            external_id=listing_id,
                             url=url,
                             title=title.strip(),
                             price_raw=price_raw,
@@ -529,34 +616,55 @@ class ScoutAgent:
                             location=location.strip(),
                             surface_mp=surface_mp,
                             rooms=rooms,
-                            features_raw=features,
+                            features_raw=features_raw,
                             metro_nearby=metro_nearby,
                             scraped_at=datetime.now(timezone.utc).isoformat(),
-                            raw_data={'page': page_num}
+                            raw_data={'json_extraction': True, 'page': page_num}
                         )
                         
                         # Validate before adding
                         is_valid, error_msg = self.validate_listing(listing)
                         if is_valid:
-                            all_listings.append(listing)
+                            listings.append(listing)
                         else:
-                            logger.debug(f"  ❌ Rejected: {error_msg}")
+                            logger.warning(f"  ❌ Rejected: {error_msg} | {title[:40]}... | {price_eur}€ | {location}")
                         
                     except Exception as e:
-                        logger.warning(f"  ⚠️  Error parsing card: {e}")
+                        logger.warning(f"  ⚠️  Error parsing listing: {e}")
                         continue
                 
-                logger.info(f"  ✅ Page {page_num} complete. Total: {len(all_listings)} listings")
+                logger.info(f"  ✅ Page {page_num}: {len(listings)} valid listings")
                 
-                # Rate limiting
-                if page_num < self.config.max_pages:
-                    await asyncio.sleep(self.config.rate_limit_delay)
-                
-            except Exception as e:
-                logger.error(f"  ❌ Error on page {page_num}: {e}")
-                continue
+        except Exception as e:
+            logger.error(f"Error scraping Storia JSON: {e}")
         
-        logger.info(f"✅ Storia.ro bulk complete: {len(all_listings)} listings from {page_num} pages")
+        return listings
+
+    async def scrape_storia_bulk(self, page: Page = None) -> List[Listing]:
+        """Bulk scrape Storia.ro using JSON extraction (no browser needed)."""
+        logger.info(f"🕵️  Bulk scraping Storia.ro (max {self.config.max_pages} pages) via JSON...")
+        all_listings = []
+        
+        for page_num in range(1, self.config.max_pages + 1):
+            if len(all_listings) >= self.config.max_listings_total:
+                logger.info(f"⛔ Reached max listings limit: {self.config.max_listings_total}")
+                break
+            
+            # Scrape this page
+            page_listings = await self.scrape_storia_json(page_num)
+            
+            if not page_listings:
+                logger.info("  ✅ No more listings available")
+                break
+            
+            all_listings.extend(page_listings)
+            logger.info(f"  📊 Total so far: {len(all_listings)} listings")
+            
+            # Rate limiting between pages
+            if page_num < self.config.max_pages:
+                await asyncio.sleep(self.config.rate_limit_delay)
+        
+        logger.info(f"✅ Storia.ro bulk complete: {len(all_listings)} listings")
         return all_listings
     
     async def run(self, config: Optional[ScrapingConfig] = None):
@@ -573,31 +681,49 @@ class ScoutAgent:
         
         start_time = datetime.now(timezone.utc)
         total_new_listings = 0
+        all_listings = []
         
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
-            )
-            page = await context.new_page()
+        try:
+            # Scrape Storia.ro using JSON method (fast, no browser needed)
+            logger.info("\n🕵️  Starting Storia.ro bulk scrape (JSON method)...")
+            storia_listings = await self.scrape_storia_bulk()
+            all_listings.extend(storia_listings)
             
-            try:
-                # Scrape both sources with pagination
-                logger.info("\n🕵️  Starting Imobiliare.ro bulk scrape...")
-                imobiliare_listings = await self.scrape_imobiliare_bulk(page)
+            # Try Imobiliare.ro with Playwright (may be blocked by Cloudflare)
+            logger.info("\n🕵️  Starting Imobiliare.ro bulk scrape (Playwright + stealth)...")
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=['--disable-blink-features=AutomationControlled']
+                )
+                context = await browser.new_context(
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    viewport={'width': 1920, 'height': 1080},
+                    locale='en-US',
+                    timezone_id='Europe/Bucharest'
+                )
                 
-                logger.info("\n🕵️  Starting Storia.ro bulk scrape...")
-                storia_listings = await self.scrape_storia_bulk(page)
+                # Hide webdriver property
+                await context.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                """)
                 
-                all_listings = imobiliare_listings + storia_listings
+                page = await context.new_page()
                 
-            except Exception as e:
-                logger.error(f"Scraping error: {e}")
-                import traceback
-                traceback.print_exc()
-            
-            finally:
-                await browser.close()
+                try:
+                    imobiliare_listings = await self.scrape_imobiliare_bulk(page)
+                    all_listings.extend(imobiliare_listings)
+                except Exception as e:
+                    logger.error(f"Imobiliare scraping error: {e}")
+                finally:
+                    await browser.close()
+                
+        except Exception as e:
+            logger.error(f"Scraping error: {e}")
+            import traceback
+            traceback.print_exc()
         
         # Process in batches
         if all_listings:
