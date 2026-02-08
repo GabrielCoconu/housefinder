@@ -762,6 +762,14 @@ class ScoutAgent:
             existing = self.db.get_existing_urls(urls)
             
             new_listings = [l for l in listing_dicts if l['url'] not in existing]
+            # Deduplicate by URL within the batch (same listing can appear on multiple pages)
+            seen_urls = set()
+            deduped = []
+            for l in new_listings:
+                if l['url'] not in seen_urls:
+                    seen_urls.add(l['url'])
+                    deduped.append(l)
+            new_listings = deduped
             logger.info(f"📊 Found {len(existing)} duplicates, {len(new_listings)} new listings")
             
             if new_listings:
