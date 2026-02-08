@@ -31,3 +31,6 @@ Thumbs.db
 
 # Playwright
 playwright*
+
+# Imobiliare.ro browser state (session cookies)
+imobiliare_state.json

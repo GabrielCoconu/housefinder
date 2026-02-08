@@ -23,6 +23,9 @@ from urllib.parse import urljoin, urlparse
 
 from playwright.async_api import async_playwright, Page, Browser, TimeoutError as PlaywrightTimeout
 from supabase_manager import SupabaseManager
+from imobiliare_auth import (
+    state_file_exists, get_state_path, needs_refresh, is_blocked, USER_AGENT
+)
 
 # Setup logging to file
 log_dir = os.path.join(os.path.dirname(__file__), 'logs')
@@ -82,23 +85,46 @@ class ScoutAgent:
         self.eur_rate = 4.97
     
     def parse_price(self, price_text: str) -> Tuple[str, Optional[int]]:
-        """Parse price text to raw and EUR values."""
+        """Parse price text to raw and EUR values.
+
+        Handles European formatting where dots are thousand separators
+        and commas are decimal separators (e.g. "875.000 €", "1.620.000 €").
+        """
         if not price_text:
             return "", None
-        
-        price_clean = re.sub(r'[^\d.,]', '', price_text).replace(',', '.')
-        
+
+        # Strip whitespace/newlines that come from HTML
+        price_text_clean = ' '.join(price_text.split())
+
+        # Extract digits, dots and commas
+        price_clean = re.sub(r'[^\d.,]', '', price_text_clean)
+
+        # Handle European format: dots are thousand separators, commas are decimal
+        # e.g. "875.000" -> "875000", "1.620.000" -> "1620000", "224,25" -> "224.25"
+        if '.' in price_clean and ',' in price_clean:
+            # Both present: dots are thousands, comma is decimal (e.g. "1.234,56")
+            price_clean = price_clean.replace('.', '').replace(',', '.')
+        elif '.' in price_clean:
+            # Only dots: check if it looks like thousands separator
+            # "875.000" has exactly 3 digits after dot = thousand separator
+            parts = price_clean.split('.')
+            if all(len(p) == 3 for p in parts[1:]):
+                price_clean = price_clean.replace('.', '')
+            # else: single dot like "875.5" is a decimal
+        elif ',' in price_clean:
+            # Only comma: it's a decimal separator
+            price_clean = price_clean.replace(',', '.')
+
         try:
+            price_value = float(price_clean)
             if 'ron' in price_text.lower() or 'lei' in price_text.lower():
-                price_ron = float(price_clean)
-                price_eur = int(price_ron / self.eur_rate)
+                price_eur = int(price_value / self.eur_rate)
             else:
-                # Assume EUR
-                price_eur = int(float(price_clean))
-            
-            return price_text.strip(), price_eur
+                price_eur = int(price_value)
+
+            return price_text_clean, price_eur
         except (ValueError, TypeError):
-            return price_text.strip(), None
+            return price_text_clean, None
     
     def parse_surface(self, surface_text: str) -> Optional[int]:
         """Extract surface area in mp."""
@@ -198,22 +224,10 @@ class ScoutAgent:
             if city in title_lower:
                 return False, f"Listing outside Bucharest: {city}"
         
-        # For Storia, "Bucuresti" is acceptable if title contains sector info or neighborhood
-        # (Berceni, Militari, Drumul Taberei, etc. are all in Bucharest)
-        if location.lower().strip() == 'bucuresti':
-            # Check if title has neighborhood/sector info
-            bucharest_indicators = ['sector', 'berceni', 'militari', 'drumul taberei', 'titan', 'pipera',
-                                   'aviatorilor', 'victoriei', 'universitate', 'obor', 'bragadiru',
-                                   'chitila', 'popesti-leordeni', 'voluntari', 'otopeni', 'baneasa',
-                                   'aparatorii patriei', 'salaj', 'rahova', 'ferentari', 'tei', 'floreasca',
-                                   'domenii', '1 mai', 'grivita', 'basarab', 'crangasi', 'militari',
-                                   'gorjului', 'lujerului', 'politehnica', 'cotroceni', 'eroilor',
-                                   'splai', 'dristor', 'muncii', 'timpuri noi', 'tineretului',
-                                   'vacaresti', 'sos', 'bulevardul', 'strada', 'calea', 'bld']
-            has_indicator = any(ind in title_lower for ind in bucharest_indicators)
-            
-            if not has_indicator:
-                return False, "Location too generic (just 'Bucuresti' with no sector/neighborhood)"
+        # For Storia/Imobiliare, "Bucuresti" is acceptable — the search is already
+        # filtered to Bucharest, so all results are in the city.  We only reject
+        # listings that explicitly mention a non-Bucharest city (handled above).
+        # No need to require neighborhood in the title.
         
         return True, "OK"
     
@@ -387,108 +401,129 @@ class ScoutAgent:
         logger.info(f"✅ Scraped {len(listings)} listings from Storia.ro")
         return listings
     
-    async def scrape_imobiliare_bulk(self, page: Page) -> List[Listing]:
-        """Bulk scrape Imobiliare.ro with pagination."""
+    async def scrape_imobiliare_bulk(self) -> List[Listing]:
+        """Bulk scrape Imobiliare.ro with pagination using curl_cffi + saved cookies."""
+        from bs4 import BeautifulSoup
+        from curl_cffi.requests import AsyncSession
+
         logger.info(f"🕵️  Bulk scraping Imobiliare.ro (max {self.config.max_pages} pages)...")
         all_listings = []
         base_url = "https://www.imobiliare.ro"
-        
-        for page_num in range(1, self.config.max_pages + 1):
-            if len(all_listings) >= self.config.max_listings_total:
-                logger.info(f"⛔ Reached max listings limit: {self.config.max_listings_total}")
-                break
-            
-            try:
-                # Build URL with pagination
-                if page_num == 1:
-                    search_url = f"{base_url}/vanzare-case-vile/{self.config.location}?pretmax={self.config.max_price}"
-                else:
-                    search_url = f"{base_url}/vanzare-case-vile/{self.config.location}?pagina={page_num}&pretmax={self.config.max_price}"
-                
-                logger.info(f"  📄 Page {page_num}: {search_url}")
-                await page.goto(search_url, wait_until='networkidle', timeout=30000)
-                
-                # Wait for listings
+
+        # Load cookies from state file
+        with open(get_state_path()) as f:
+            state = json.load(f)
+        cookies = {c['name']: c['value'] for c in state.get('cookies', [])}
+
+        async with AsyncSession(impersonate="safari17_0") as client:
+            for page_num in range(1, self.config.max_pages + 1):
+                if len(all_listings) >= self.config.max_listings_total:
+                    logger.info(f"⛔ Reached max listings limit: {self.config.max_listings_total}")
+                    break
+
                 try:
-                    await page.wait_for_selector('.box-anunt', timeout=10000)
-                except PlaywrightTimeout:
-                    logger.warning(f"  ⚠️  No listings found on page {page_num}")
-                    break
-                
-                # Get listings on this page
-                cards = await page.query_selector_all('.box-anunt')
-                logger.info(f"  📊 Found {len(cards)} listings on page {page_num}")
-                
-                if not cards:
-                    logger.info("  ✅ No more listings available")
-                    break
-                
-                # Parse each card
-                for card in cards:
-                    try:
-                        title_el = await card.query_selector('.titlu-anunt, h2')
-                        title = await title_el.inner_text() if title_el else "N/A"
-                        
-                        price_el = await card.query_selector('.pret, .price')
-                        price_text = await price_el.inner_text() if price_el else ""
-                        price_raw, price_eur = self.parse_price(price_text)
-                        
-                        location_el = await card.query_selector('.location, .locatie')
-                        location = await location_el.inner_text() if location_el else "Bucuresti"
-                        
-                        surface_el = await card.query_selector('.surface, .suprafata')
-                        surface_text = await surface_el.inner_text() if surface_el else ""
-                        surface_mp = self.parse_surface(surface_text)
-                        
-                        rooms_el = await card.query_selector('.rooms, .camere')
-                        rooms_text = await rooms_el.inner_text() if rooms_el else ""
-                        rooms = self.parse_rooms(rooms_text)
-                        
-                        link_el = await card.query_selector('a')
-                        href = await link_el.get_attribute('href') if link_el else ""
-                        url = urljoin(base_url, href)
-                        
-                        features = f"{surface_text} {rooms_text}".strip()
-                        metro_nearby = self.check_metro_nearby(f"{title} {location} {features}")
-                        
-                        listing = Listing(
-                            source='imobiliare.ro',
-                            external_id=href.split('/')[-1] if '/' in href else '',
-                            url=url,
-                            title=title.strip(),
-                            price_raw=price_raw,
-                            price_eur=price_eur,
-                            location=location.strip(),
-                            surface_mp=surface_mp,
-                            rooms=rooms,
-                            features_raw=features,
-                            metro_nearby=metro_nearby,
-                            scraped_at=datetime.now(timezone.utc).isoformat(),
-                            raw_data={'page': page_num}
-                        )
-                        
-                        # Validate before adding
-                        is_valid, error_msg = self.validate_listing(listing)
-                        if is_valid:
-                            all_listings.append(listing)
-                        else:
-                            logger.debug(f"  ❌ Rejected: {error_msg}")
-                        
-                    except Exception as e:
-                        logger.warning(f"  ⚠️  Error parsing card: {e}")
-                        continue
-                
-                logger.info(f"  ✅ Page {page_num} complete. Total: {len(all_listings)} listings")
-                
-                # Rate limiting
-                if page_num < self.config.max_pages:
-                    await asyncio.sleep(self.config.rate_limit_delay)
-                
-            except Exception as e:
-                logger.error(f"  ❌ Error on page {page_num}: {e}")
-                continue
-        
-        logger.info(f"✅ Imobiliare.ro bulk complete: {len(all_listings)} listings from {page_num} pages")
+                    if page_num == 1:
+                        search_url = f"{base_url}/vanzare-case-vile/{self.config.location}?pretmax={self.config.max_price}"
+                    else:
+                        search_url = f"{base_url}/vanzare-case-vile/{self.config.location}?pagina={page_num}&pretmax={self.config.max_price}"
+
+                    logger.info(f"  📄 Page {page_num}: {search_url}")
+                    response = await client.get(
+                        search_url,
+                        cookies=cookies,
+                        headers={
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                            'Accept-Language': 'ro-RO,ro;q=0.9,en;q=0.5',
+                        },
+                        allow_redirects=True,
+                        timeout=30,
+                    )
+                    if response.status_code == 403:
+                        logger.error(f"  🚫 403 Forbidden on page {page_num} — re-run setup_imobiliare.py.")
+                        break
+                    response.raise_for_status()
+                    html = response.text
+
+                    if is_blocked(html):
+                        logger.error(f"  🚫 DataDome block on page {page_num} — re-run setup_imobiliare.py.")
+                        break
+
+                    soup = BeautifulSoup(html, 'html.parser')
+                    cards = soup.select('.listing-card')
+                    logger.info(f"  📊 Found {len(cards)} listings on page {page_num}")
+
+                    if not cards:
+                        logger.info("  ✅ No more listings available")
+                        break
+
+                    for card in cards:
+                        try:
+                            # Title: prefer the hidden desktop title, fall back to line-clamp
+                            title_el = card.select_one('span.text-title') or card.select_one('span.line-clamp-2')
+                            title = title_el.get_text(strip=True) if title_el else "N/A"
+
+                            # Price: bold text with € sign
+                            price_el = card.select_one('p.text-title')
+                            price_text = price_el.get_text(strip=True) if price_el else ""
+                            price_raw, price_eur = self.parse_price(price_text)
+
+                            # Location: grey text below the title
+                            location_el = card.select_one('div.text-grey-650 p, div.text-grey-650')
+                            location = location_el.get_text(strip=True) if location_el else "Bucuresti"
+
+                            # Features come as swiper-slide chips
+                            feature_chips = card.select('.swiper-slide span.whitespace-nowrap')
+                            feature_texts = [chip.get_text(strip=True) for chip in feature_chips]
+
+                            surface_text = next((f for f in feature_texts if 'mp' in f and 'teren' not in f), "")
+                            surface_mp = self.parse_surface(surface_text)
+
+                            rooms_text = next((f for f in feature_texts if 'camer' in f), "")
+                            rooms = self.parse_rooms(rooms_text)
+
+                            link_el = card.select_one('a[href*="/oferta/"]')
+                            href = link_el['href'] if link_el else ""
+                            url = urljoin(base_url, href)
+
+                            features = " ".join(feature_texts)
+                            metro_nearby = self.check_metro_nearby(f"{title} {location} {features}")
+
+                            listing = Listing(
+                                source='imobiliare.ro',
+                                external_id=href.split('/')[-1] if '/' in href else '',
+                                url=url,
+                                title=title.strip(),
+                                price_raw=price_raw,
+                                price_eur=price_eur,
+                                location=location.strip(),
+                                surface_mp=surface_mp,
+                                rooms=rooms,
+                                features_raw=features,
+                                metro_nearby=metro_nearby,
+                                scraped_at=datetime.now(timezone.utc).isoformat(),
+                                raw_data={'page': page_num}
+                            )
+
+                            is_valid, error_msg = self.validate_listing(listing)
+                            if is_valid:
+                                all_listings.append(listing)
+                            else:
+                                logger.debug(f"  ❌ Rejected: {error_msg}")
+
+                        except Exception as e:
+                            logger.warning(f"  ⚠️  Error parsing card: {e}")
+                            continue
+
+                    logger.info(f"  ✅ Page {page_num} complete. Total: {len(all_listings)} listings")
+
+                    if page_num < self.config.max_pages:
+                        await asyncio.sleep(self.config.rate_limit_delay)
+
+                except Exception as e:
+                    logger.error(f"  ❌ Error on page {page_num}: {e}")
+                    continue
+
+        logger.info(f"✅ Imobiliare.ro bulk complete: {len(all_listings)} listings")
         return all_listings
     
     def extract_next_data(self, html: str) -> Optional[Dict]:
@@ -696,36 +731,18 @@ class ScoutAgent:
             storia_listings = await self.scrape_storia_bulk()
             all_listings.extend(storia_listings)
             
-            # Try Imobiliare.ro with Playwright (may be blocked by Cloudflare)
-            logger.info("\n🕵️  Starting Imobiliare.ro bulk scrape (Playwright + stealth)...")
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=['--disable-blink-features=AutomationControlled']
-                )
-                context = await browser.new_context(
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    viewport={'width': 1920, 'height': 1080},
-                    locale='en-US',
-                    timezone_id='Europe/Bucharest'
-                )
-                
-                # Hide webdriver property
-                await context.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    });
-                """)
-                
-                page = await context.new_page()
-                
+            # Try Imobiliare.ro with httpx + saved cookies (no Playwright needed)
+            logger.info("\n🕵️  Starting Imobiliare.ro bulk scrape (httpx + saved cookies)...")
+            if not state_file_exists():
+                logger.warning("⚠️  imobiliare_state.json not found — run setup_imobiliare.py first. Skipping Imobiliare.ro.")
+            else:
+                if needs_refresh():
+                    logger.warning("⚠️  imobiliare_state.json is older than 12 hours — consider re-running setup_imobiliare.py")
                 try:
-                    imobiliare_listings = await self.scrape_imobiliare_bulk(page)
+                    imobiliare_listings = await self.scrape_imobiliare_bulk()
                     all_listings.extend(imobiliare_listings)
                 except Exception as e:
                     logger.error(f"Imobiliare scraping error: {e}")
-                finally:
-                    await browser.close()
                 
         except Exception as e:
             logger.error(f"Scraping error: {e}")
@@ -740,7 +757,7 @@ class ScoutAgent:
             listing_dicts = [asdict(l) for l in all_listings]
             
             # Check for duplicates in batches
-            urls = [l['url'] for l in all_listings]
+            urls = [l.url for l in all_listings]
             existing = self.db.get_existing_urls(urls)
             
             new_listings = [l for l in listing_dicts if l['url'] not in existing]
