@@ -52,12 +52,13 @@ class CasaHuntOrchestrator:
         }
         self.running = False
         
-    async def run_scout(self):
+    async def run_scout(self, on_batch_inserted=None):
         """Run the scout agent to scrape listings."""
         logger.info("🕵️  Running Scout Agent...")
         try:
-            config = ScrapingConfig(max_pages=3)
-            await self.agents['scout'].run(config)
+            max_pages = int(os.getenv('MAX_PAGES', '10'))
+            config = ScrapingConfig(max_pages=max_pages)
+            await self.agents['scout'].run(config, on_batch_inserted=on_batch_inserted)
             logger.info("✅ Scout completed")
         except Exception as e:
             logger.error(f"❌ Scout failed: {e}")
@@ -90,30 +91,88 @@ class CasaHuntOrchestrator:
             logger.error(f"❌ Notifier failed: {e}")
     
     async def run_full_pipeline(self):
-        """Run the complete pipeline: Scout → Analyzer → Decision → Notifier"""
+        """Run the complete pipeline with streaming notifications.
+
+        As each batch of listings is inserted, immediately process them through
+        analyze -> decide -> notify, so Telegram alerts arrive in real-time.
+        """
         logger.info("\n" + "="*60)
-        logger.info("🏠 CASA HUNT - FULL PIPELINE STARTING")
+        logger.info("🏠 CASA HUNT - FULL PIPELINE STARTING (streaming)")
         logger.info("="*60 + "\n")
-        
+
         start_time = datetime.now(timezone.utc)
-        
-        # Step 1: Scout (daily at 10:00)
-        await self.run_scout()
-        
-        # Step 2: Analyzer (process new listings)
+        stats = {'analyzed': 0, 'approved': 0, 'notified': 0}
+
+        analyzer = self.agents['analyzer']
+        decider = self.agents['decision']
+        notifier = self.agents['notifier']
+
+        async def process_batch(listing_ids):
+            """Process a batch of newly inserted listings through the full pipeline."""
+            logger.info(f"  📡 Streaming pipeline: processing {len(listing_ids)} listings...")
+
+            # 1. Analyze: score each listing
+            listings = self.supabase.get_listings_by_ids(listing_ids)
+            high_score_ids = []
+            for listing in listings:
+                try:
+                    score = analyzer.calculate_score(listing)
+                    self.supabase.update_listing_score(listing['id'], score)
+                    stats['analyzed'] += 1
+                    if score >= 70:
+                        high_score_ids.append(listing['id'])
+                except Exception as e:
+                    logger.error(f"  Analyze error for {listing.get('id')}: {e}")
+
+            if not high_score_ids:
+                return
+
+            # 2. Decide: approve or reject high-score listings
+            high_listings = self.supabase.get_listings_by_ids(high_score_ids)
+            approved_ids = []
+            decisions = {}
+            for listing in high_listings:
+                try:
+                    decision, reason = decider.make_decision(listing)
+                    self.supabase.update_listing_decision(listing['id'], decision, reason)
+                    if decision == 'APPROVE':
+                        approved_ids.append(listing['id'])
+                        decisions[listing['id']] = reason
+                        stats['approved'] += 1
+                except Exception as e:
+                    logger.error(f"  Decision error for {listing.get('id')}: {e}")
+
+            if not approved_ids:
+                return
+
+            # 3. Notify: send Telegram for approved listings immediately
+            approved_listings = self.supabase.get_listings_by_ids(approved_ids)
+            for listing in approved_listings:
+                try:
+                    reason = decisions.get(listing['id'], '')
+                    message = notifier.format_telegram_message(listing, reason)
+                    result = await notifier.send_telegram(message)
+                    if result:
+                        self.supabase.mark_listing_notified(listing['id'])
+                        stats['notified'] += 1
+                    await asyncio.sleep(1)  # Telegram rate limit
+                except Exception as e:
+                    logger.error(f"  Notify error for {listing.get('id')}: {e}")
+
+        # Step 1: Scout with streaming callback
+        await self.run_scout(on_batch_inserted=process_batch)
+
+        # Step 2: Catch any stragglers (unscored, undecided, unnotified)
         await self.run_analyzer()
-        
-        # Step 3: Decision (approve high scores)
         await self.run_decision()
-        
-        # Step 4: Notifier (send alerts)
         await self.run_notifier()
-        
+
         end_time = datetime.now(timezone.utc)
         duration = (end_time - start_time).total_seconds()
-        
+
         logger.info("\n" + "="*60)
         logger.info(f"✅ PIPELINE COMPLETE in {duration:.1f}s")
+        logger.info(f"   Analyzed: {stats['analyzed']} | Approved: {stats['approved']} | Notified: {stats['notified']}")
         logger.info("="*60 + "\n")
     
     async def run_daemon(self):

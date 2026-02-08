@@ -23,6 +23,7 @@ from urllib.parse import urljoin, urlparse
 
 from playwright.async_api import async_playwright, Page, Browser, TimeoutError as PlaywrightTimeout
 from supabase_manager import SupabaseManager
+from url_cache import filter_new_urls, save_cache
 from imobiliare_auth import (
     state_file_exists, get_state_path, needs_refresh, is_blocked, USER_AGENT
 )
@@ -572,8 +573,15 @@ class ScoutAgent:
             ) as client:
                 response = await client.get(search_url)
                 response.raise_for_status()
+
+                # Detect pagination redirect (Storia caps results, later pages redirect back)
+                final_url = str(response.url)
+                if page_num > 1 and f'page={page_num}' not in final_url:
+                    logger.info(f"  ⛔ Pagination redirect detected (page {page_num} -> {final_url}). Stopping.")
+                    return listings
+
                 html = response.text
-                
+
                 logger.info(f"  📊 HTML size: {len(html):,} bytes")
                 
                 # Extract NEXT_DATA JSON
@@ -710,8 +718,14 @@ class ScoutAgent:
         logger.info(f"✅ Storia.ro bulk complete: {len(all_listings)} listings")
         return all_listings
     
-    async def run(self, config: Optional[ScrapingConfig] = None):
-        """Main scraping loop - BULK MODE for 6 months of data."""
+    async def run(self, config: Optional[ScrapingConfig] = None, on_batch_inserted=None):
+        """Main scraping loop - BULK MODE for 6 months of data.
+
+        Args:
+            config: Scraping configuration
+            on_batch_inserted: Optional async callback(listing_ids) called after
+                              each batch insert, for streaming pipeline processing.
+        """
         if config:
             self.config = config
         
@@ -757,11 +771,11 @@ class ScoutAgent:
             # Convert to dicts
             listing_dicts = [asdict(l) for l in all_listings]
             
-            # Check for duplicates in batches
+            # Check for duplicates using local cache + Supabase fallback
             urls = [l.url for l in all_listings]
-            existing = self.db.get_existing_urls(urls)
-            
-            new_listings = [l for l in listing_dicts if l['url'] not in existing]
+            existing_urls = filter_new_urls(urls, self.db)
+
+            new_listings = [l for l in listing_dicts if l['url'] not in existing_urls]
             # Deduplicate by URL within the batch (same listing can appear on multiple pages)
             seen_urls = set()
             deduped = []
@@ -770,44 +784,40 @@ class ScoutAgent:
                     seen_urls.add(l['url'])
                     deduped.append(l)
             new_listings = deduped
-            logger.info(f"📊 Found {len(existing)} duplicates, {len(new_listings)} new listings")
-            
+            logger.info(f"📊 Found {len(existing_urls)} duplicates, {len(new_listings)} new listings")
+
             if new_listings:
                 # Process in batches
                 batch_size = self.config.batch_size
                 total_inserted = 0
-                
+
                 for i in range(0, len(new_listings), batch_size):
                     batch = new_listings[i:i+batch_size]
                     inserted_ids = self.db.insert_listings(batch)
                     total_inserted += len(inserted_ids)
                     logger.info(f"  ✅ Batch {i//batch_size + 1}: Inserted {len(inserted_ids)} listings")
-                
+
+                    # Trigger streaming pipeline (analyze -> decide -> notify)
+                    if on_batch_inserted and inserted_ids:
+                        await on_batch_inserted(inserted_ids)
+
                 logger.info(f"\n🎉 Total inserted: {total_inserted} listings")
-                
-                # Create events and missions
+
+                # Create events
                 self.db.create_event('listings_scraped', {
                     'count': total_inserted,
                     'sources': list(set(l['source'] for l in new_listings)),
                     'timestamp': start_time.isoformat(),
                     'mode': 'bulk'
                 })
-                
-                # Create analyze missions in batches
-                all_ids = [l['id'] for l in new_listings if 'id' in l]
-                for i in range(0, len(all_ids), batch_size):
-                    batch_ids = all_ids[i:i+batch_size]
-                    self.db.create_mission('analyze', 'pending', {
-                        'listing_ids': batch_ids,
-                        'count': len(batch_ids),
-                        'batch': i//batch_size + 1
-                    })
-                
-                logger.info(f"🎯 Created {len(range(0, len(all_ids), batch_size))} analyze missions")
-                
-                logger.info(f"🎯 Created analyze mission for {len(inserted_ids)} listings")
+
+                # Update local URL cache with all known URLs
+                all_known = existing_urls | {l['url'] for l in new_listings}
+                save_cache(all_known)
             else:
                 logger.info("No new listings to save")
+                # Still update cache even if nothing new
+                save_cache(existing_urls)
         
         # Log agent state
         end_time = datetime.now(timezone.utc)

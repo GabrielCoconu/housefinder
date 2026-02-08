@@ -34,3 +34,6 @@ playwright*
 
 # Imobiliare.ro browser state (session cookies)
 imobiliare_state.json
+
+# Local URL cache (machine-specific)
+url_cache.json

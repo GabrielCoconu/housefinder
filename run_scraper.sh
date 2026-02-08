@@ -1,6 +1,7 @@
 #!/bin/bash
-# Casa Hunt - Scraper Runner
-# Called by cron to run the daily property search
+# Casa Hunt - Full Pipeline Runner
+# Called by cron to run the complete property search pipeline
+# Includes resource protection to avoid blocking the VPS
 
 set -euo pipefail
 
@@ -12,10 +13,16 @@ TIMESTAMP=$(date "+%Y-%m-%d_%H-%M-%S")
 # Ensure log directory exists
 mkdir -p "${LOG_DIR}"
 
-echo "[${TIMESTAMP}] Starting scraper run..." >> "${LOG_DIR}/cron.log"
+echo "[${TIMESTAMP}] Starting full pipeline run..." >> "${LOG_DIR}/cron.log"
 
-# Run the scout agent
+# Resource protection:
+#   timeout 600  = kill after 10 minutes
+#   nice -n 10   = lower CPU priority so VPS stays responsive
+#   ulimit -v    = 512MB virtual memory cap
 cd "${PROJECT_DIR}"
-"${VENV}/python" scout_agent.py >> "${LOG_DIR}/scraper_${TIMESTAMP}.log" 2>&1
+ulimit -v 524288 2>/dev/null || true
+timeout 600 nice -n 10 "${VENV}/python" orchestrator.py --run-once \
+    >> "${LOG_DIR}/pipeline_${TIMESTAMP}.log" 2>&1
 
-echo "[$(date "+%Y-%m-%d_%H-%M-%S")] Scraper run completed." >> "${LOG_DIR}/cron.log"
+EXIT_CODE=$?
+echo "[$(date "+%Y-%m-%d_%H-%M-%S")] Pipeline completed (exit=${EXIT_CODE})." >> "${LOG_DIR}/cron.log"
