@@ -623,7 +623,8 @@ class ScoutAgent:
                         location = f"{city}, {province}" if city and province else city or province or "Bucuresti"
                         
                         # Features
-                        surface_mp = item.get('areaInSquareMeters')
+                        surface_mp_raw = item.get('areaInSquareMeters')
+                        surface_mp = int(surface_mp_raw) if surface_mp_raw is not None else None
                         rooms_raw = item.get('roomsNumber')
                         # Convert string rooms (ONE, TWO, THREE, FOUR) to integers
                         rooms_map = {'ONE': 1, 'TWO': 2, 'THREE': 3, 'FOUR': 4, 'FIVE': 5, 
@@ -631,7 +632,7 @@ class ScoutAgent:
                         if isinstance(rooms_raw, str):
                             rooms = rooms_map.get(rooms_raw.upper())
                         else:
-                            rooms = rooms_raw
+                            rooms = int(rooms_raw) if rooms_raw is not None else None
                         terrain = item.get('terrainAreaInSquareMeters')
                         
                         # Features raw
