@@ -122,20 +122,26 @@ Casa Hunt is a multi-agent system for automated house hunting in Bucharest. It s
 
 ## Installation
 
-### 1. Install Dependencies
+### 1. Clone Repository
 
 ```bash
-cd Projects/casa_hunt
+git clone https://github.com/GabrielCoconu/housefinder.git
+cd housefinder
+```
+
+### 2. Install Dependencies
+
+```bash
 pip install -r requirements.txt
 ```
 
-### 2. Setup Supabase
+### 3. Setup Supabase
 
 1. Create project at [supabase.com](https://supabase.com)
 2. Run SQL schema from `supabase/schema.sql`
 3. Copy `.env.example` to `.env` and fill credentials
 
-### 3. Configure Environment
+### 4. Configure Environment
 
 ```bash
 # .env file
@@ -143,6 +149,36 @@ SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_KEY=your-service-role-key
 TELEGRAM_BOT_TOKEN=your-bot-token
 TELEGRAM_CHAT_ID=your-chat-id
+```
+
+## Running Locally (Recommended for Imobiliare.ro)
+
+**Important:** Imobiliare.ro blocks VPS/datacenter IPs with DataDome CAPTCHA. 
+**Run on your local laptop for best results.**
+
+### Quick Test - Storia.ro (Works everywhere)
+```bash
+python test_quick.py
+```
+
+### Full Pipeline Test
+```bash
+python test_full_pipeline.py
+```
+
+### Imobiliare.ro with Cookies (Local only)
+
+1. Log in to imobiliare.ro in your browser
+2. Export cookies using "Cookie-Editor" extension or DevTools
+3. Edit `test_imobiliare_cookies.py` and paste your cookies
+4. Run:
+```bash
+python test_imobiliare_cookies.py
+```
+
+### Imobiliare.ro with Stealth Mode
+```bash
+python test_imobiliare.py
 ```
 
 ## Usage
@@ -214,6 +250,24 @@ tail -f logs/orchestrator.log
 
 ## Troubleshooting
 
+### Imobiliare.ro returns 403/CAPTCHA
+**This is expected on VPS/datacenter IPs!** 
+
+Imobiliare.ro uses DataDome protection which blocks:
+- VPS IPs (Hetzner, AWS, DigitalOcean, etc.)
+- Datacenter IP ranges
+- Automated traffic patterns
+
+**Solutions:**
+1. **Run locally on your laptop** (recommended) - uses your home ISP IP
+2. Use residential proxy (Bright Data, Smartproxy)
+3. Use CapSolver API for CAPTCHA solving
+
+### Storia.ro works but Imobiliare.ro doesn't
+- Storia.ro has lighter protection (JSON extraction works)
+- Imobiliare.ro uses advanced fingerprinting
+- Run Imobiliare.ro scraper locally with fresh cookies
+
 ### Agent not running
 - Check Supabase credentials
 - Verify network connectivity
@@ -227,6 +281,14 @@ tail -f logs/orchestrator.log
 ### Duplicate listings
 - Supabase `url` column has unique constraint
 - Scout checks existing URLs before insert
+
+## Platform Support
+
+| Platform | Storia.ro | Imobiliare.ro | Notes |
+|----------|-----------|---------------|-------|
+| Local laptop | ✅ | ✅ | Best for both sites |
+| VPS/Hetzner | ✅ | ❌ | Imobiliare.ro blocked |
+| With proxy | ✅ | ✅ | Residential proxy needed |
 
 ## Credits
 
